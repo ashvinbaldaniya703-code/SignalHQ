@@ -1,0 +1,5 @@
+requests
+yfinance
+pandas
+numpy
+dhanhq>=2.1.0
