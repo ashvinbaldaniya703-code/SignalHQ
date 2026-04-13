@@ -1,6 +1,5 @@
 import os
 import requests
-import json
 import time
 from datetime import datetime, timedelta
 import pandas as pd
@@ -15,9 +14,16 @@ DHAN_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicG
 
 # ===================================
 
-from dhanhq import dhanhq
-dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-print("✅ Dhan API initialized")
+# Try to import dhanhq, but don't crash if not available
+try:
+    from dhanhq import dhanhq
+    dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+    DHAN_AVAILABLE = True
+    print("✅ Dhan API initialized")
+except Exception as e:
+    dhan = None
+    DHAN_AVAILABLE = False
+    print(f"⚠️ Dhan not available: {e}")
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -30,6 +36,9 @@ def send_telegram(text):
         print(f"Send failed: {e}")
 
 def get_nifty_option_chain():
+    """Fetch option chain from Dhan if available"""
+    if not DHAN_AVAILABLE:
+        return None
     try:
         underlying_security_id = "13"
         option_chain = dhan.option_chain(underlying_security_id=underlying_security_id, expiry_code="NEAREST")
@@ -63,20 +72,44 @@ def calculate_max_pain(df):
         pains.append(total)
     return strikes[np.argmin(pains)]
 
-def get_historical_data(symbol, exchange_segment, instrument_type, days=30):
+def get_historical_data_yfinance(ticker="^NSEI", days=30):
+    """Fetch historical data from Yahoo Finance as fallback"""
     try:
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=days)
-        return dhan.historical_daily_data(
-            symbol=symbol,
-            exchange_segment=exchange_segment,
-            instrument_type=instrument_type,
-            from_date=from_date.strftime("%Y-%m-%d"),
-            to_date=to_date.strftime("%Y-%m-%d")
-        )
+        end = datetime.now()
+        start = end - timedelta(days=days)
+        data = yf.download(ticker, start=start, end=end, progress=False)
+        if data.empty:
+            return None
+        df = data.reset_index()
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        # Rename to match our expected columns
+        df.rename(columns={'Close': 'close', 'Volume': 'volume', 'High': 'high', 'Low': 'low', 'Open': 'open'}, inplace=True)
+        df['closePrice'] = df['close']
+        return df.to_dict('records')
     except Exception as e:
-        print(f"Historical error: {e}")
+        print(f"YFinance error: {e}")
         return None
+
+def get_historical_data_dhan(symbol, exchange_segment, instrument_type, days=30):
+    """Try Dhan first, fallback to Yahoo"""
+    if DHAN_AVAILABLE:
+        try:
+            to_date = datetime.now()
+            from_date = to_date - timedelta(days=days)
+            data = dhan.historical_daily_data(
+                symbol=symbol,
+                exchange_segment=exchange_segment,
+                instrument_type=instrument_type,
+                from_date=from_date.strftime("%Y-%m-%d"),
+                to_date=to_date.strftime("%Y-%m-%d")
+            )
+            if data and len(data) > 0:
+                return data
+        except Exception as e:
+            print(f"Dhan historical error: {e}")
+    # Fallback to Yahoo
+    print("Using Yahoo Finance for historical data")
+    return get_historical_data_yfinance("^NSEI", days)
 
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -164,17 +197,21 @@ def create_pro_message():
         msg += f"Price: {gift['price']}  |  Chg: {gift['change']:+.2f} ({gift['pct']:+.2f}%)\n\n"
 
     option_df = get_nifty_option_chain()
-    hist = get_historical_data("NIFTY", "NSE", "INDEX")
+    hist = get_historical_data_dhan("NIFTY", "NSE", "INDEX", days=60)
 
-    # Default values - this ensures 'signal' is ALWAYS defined
     signal = "⚪ WAIT"
     details = {"price": 0, "rsi": 50, "pcr": 1.0, "bull_votes": 0, "bear_votes": 0,
                "max_pain": None, "ema9": 0, "ema21": 0, "ema50": 0, "vwap": 0}
 
     if hist and len(hist) > 0:
         df = pd.DataFrame(hist)
-        df['close'] = df['closePrice']
-        df['volume'] = df['volume']
+        # Ensure column names are consistent
+        if 'closePrice' in df.columns:
+            df['close'] = df['closePrice']
+        elif 'close' not in df.columns and 'Close' in df.columns:
+            df['close'] = df['Close']
+        if 'volume' not in df.columns and 'Volume' in df.columns:
+            df['volume'] = df['Volume']
         signal, details = generate_signal(df, option_df)
 
         msg += f"<b>🎯 NIFTY SIGNAL:</b> {signal}\n"
@@ -189,12 +226,13 @@ def create_pro_message():
         msg += f"   EMA50: {details['ema50']:,.2f}\n"
         msg += f"   VWAP: {details['vwap']:,.2f}\n\n"
     else:
-        msg += "⚠️ Historical data unavailable (Yahoo fallback)\n"
+        msg += "⚠️ Historical data unavailable (using latest price only)\n"
         try:
             ticker = yf.Ticker("^NSEI")
             data = ticker.history(period="1d")
             if not data.empty:
-                msg += f"   NIFTY Last: {data['Close'].iloc[-1]:,.2f}\n"
+                last = data['Close'].iloc[-1]
+                msg += f"   NIFTY Last: {last:,.2f}\n"
         except:
             pass
         msg += "\n"
@@ -207,8 +245,9 @@ def create_pro_message():
         msg += f"   CE LTP: ₹{atm['ce_ltp'].values[0]:.2f} | PE LTP: ₹{atm['pe_ltp'].values[0]:.2f}\n"
         msg += f"   CE IV: {atm['ce_iv'].values[0]:.1f}% | PE IV: {atm['pe_iv'].values[0]:.1f}%\n"
         msg += f"   PCR: {atm['pcr'].values[0]:.2f}\n\n"
+    else:
+        msg += "<b>🏛️ OPTION CHAIN</b>\n⚠️ Option chain not available (market closed or Dhan API issue)\n\n"
 
-    # Recommendation (signal is guaranteed to exist)
     if "STRONG BUY" in signal or "WEAK BUY" in signal:
         msg += "<b>💡 RECOMMENDATION</b>\n✅ BUY CALL near support\n"
         if details['price'] != 0:
